@@ -1,8 +1,8 @@
+from pathlib import Path
+
 import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.express as px
-import pymysql as sql
 
 # ============================================================
 # PAGE CONFIG
@@ -126,78 +126,109 @@ st.markdown("""
 
 
 # ============================================================
-# DATABASE CONNECTION
+# LOCAL DATA FILES (CLOUD-SAFE)
 # ============================================================
-@st.cache_resource
-def get_connection():
-    return sql.connect(
-        user="root",
-        host="localhost",
-        password="123",
-        database="pizza_store"
-    )
+DATA_DIR = Path(__file__).parent
 
 
 @st.cache_data
 def load_data():
-    conn = get_connection()
-    cur = conn.cursor()
+    """Load the exported Pizza Store tables from CSV files.
 
-    cur.execute("""
-        SELECT * FROM order_Wise_details o
-        JOIN pizza_sales p
-            ON o.order_id = p.order_id
-        JOIN pizza_wise_details pw
-            ON p.pizza_id = pw.pizza_id
-        JOIN pizza_order po
-            ON o.order_id = po.order_id
-            AND p.pizza_id = po.pizza_id;
-    """)
+    The original dashboard used MySQL. For Streamlit Community Cloud,
+    the exported tables are bundled with the app so no localhost
+    database connection is required.
+    """
+    required = [
+        "order_wise_details.csv",
+        "pizza_sales.csv",
+        "pizza_wise_details.csv",
+        "pizza_order.csv",
+    ]
 
-    rows = cur.fetchall()
-    cols = [i[0] for i in cur.description]
-    df = pd.DataFrame(data=rows, columns=cols)
-
-    # Same duplicate-column handling as the notebook
-    pizza_df = pd.DataFrame({})
-    for col in df.columns:
-        if col not in pizza_df.columns:
-            if type(df[col]) == pd.DataFrame:
-                pizza_df[col] = df[col].iloc[:, 0]
-            else:
-                pizza_df[col] = df[col]
-
-    # Same conversions as the notebook
-    pizza_df["order_id"] = pd.to_numeric(pizza_df["order_id"], errors="coerce")
-    pizza_df["total_price"] = pd.to_numeric(pizza_df["total_price"], errors="coerce")
-    pizza_df["unique_pizza_count"] = pd.to_numeric(
-        pizza_df["unique_pizza_count"], errors="coerce"
-    )
-    pizza_df["unit_price"] = pd.to_numeric(pizza_df["unit_price"], errors="coerce")
-    pizza_df["quantity"] = pd.to_numeric(pizza_df["quantity"], errors="coerce")
-    pizza_df["total_qty"] = pd.to_numeric(pizza_df["total_qty"], errors="coerce").fillna(0).astype(int)
-
-    # Create an independent copy before assigning columns to avoid
-    # pandas chained-assignment / Copy-on-Write warnings.
-    pizza_df = pizza_df.copy()
-
-    # Build a true datetime column so .dt.hour/.dt.day always work.
-    pizza_df.loc[:, "full_date"] = pd.to_datetime(
-        pizza_df["order_date"].astype(str).str.strip()
-        + " "
-        + pizza_df["order_time"].astype(str).str.strip(),
-        errors="coerce"
-    )
-
-    if pizza_df["full_date"].isna().all():
-        raise ValueError(
-            "Could not parse order_date and order_time into full_date. "
-            "Check the date/time format in the MySQL tables."
+    missing = [name for name in required if not (DATA_DIR / name).exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Missing data file(s): " + ", ".join(missing)
         )
 
-    pizza_df["total_sale"] = pizza_df["total_qty"] * pizza_df["total_price"]
+    order_df = pd.read_csv(DATA_DIR / "order_wise_details.csv", dtype=str)
+    sales_df = pd.read_csv(DATA_DIR / "pizza_sales.csv", dtype=str)
+    pizza_df = pd.read_csv(DATA_DIR / "pizza_wise_details.csv", dtype=str)
+    order_map_df = pd.read_csv(DATA_DIR / "pizza_order.csv", dtype=str)
 
-    return pizza_df
+    # Match the original SQL INNER JOIN:
+    # order_wise_details -> pizza_sales -> pizza_wise_details -> pizza_order
+    df = order_df.merge(
+        sales_df,
+        on="order_id",
+        how="inner",
+        suffixes=("_order", "_sales"),
+    )
+
+    df = df.merge(
+        pizza_df[["pizza_id", "pizza_name", "Qty", "ingredients"]],
+        on="pizza_id",
+        how="inner",
+    )
+
+    df = df.merge(
+        order_map_df[["pizza_id", "order_id"]],
+        on=["pizza_id", "order_id"],
+        how="inner",
+    )
+
+    # Keep the same first-occurrence behavior as SELECT * with duplicate
+    # column names in the original MySQL version.
+    result = pd.DataFrame({
+        "order_id": df["order_id"],
+        "total_price": df["total_price_order"],
+        "unique_pizza_count": df["unique_pizza_count"],
+        "total_qty": df["total_qty"],
+        "order_date": df["order_date_order"],
+        "unit_price": df["unit_price_order"],
+        "min_pizza_size": df["min_pizza_size"],
+        "max_pizza_size": df["max_pizza_size"],
+        "unique_category_count": df["unique_category_count"],
+        "order_details_id": df["order_details_id"],
+        "pizza_id": df["pizza_id"],
+        "quantity": df["quantity"],
+        "order_time": df["order_time"],
+        "pizza_size": df["pizza_size"],
+        "pizza_category": df["pizza_category"],
+        "pizza_ingredients": df["pizza_ingredients"],
+        "pizza_name": df["pizza_name"],
+    })
+
+    # Same conversions as the original dashboard.
+    result["order_id"] = pd.to_numeric(result["order_id"], errors="coerce")
+    result["total_price"] = pd.to_numeric(result["total_price"], errors="coerce")
+    result["unique_pizza_count"] = pd.to_numeric(
+        result["unique_pizza_count"], errors="coerce"
+    )
+    result["unit_price"] = pd.to_numeric(result["unit_price"], errors="coerce")
+    result["quantity"] = pd.to_numeric(result["quantity"], errors="coerce")
+    result["total_qty"] = (
+        pd.to_numeric(result["total_qty"], errors="coerce")
+        .fillna(0)
+        .astype(int)
+    )
+
+    result["full_date"] = pd.to_datetime(
+        result["order_date"].astype(str).str.strip()
+        + " "
+        + result["order_time"].astype(str).str.strip(),
+        errors="coerce",
+    )
+
+    if result["full_date"].isna().all():
+        raise ValueError(
+            "Could not parse order_date and order_time into full_date."
+        )
+
+    result["total_sale"] = result["total_qty"] * result["total_price"]
+
+    return result
 
 
 # ============================================================
@@ -246,11 +277,10 @@ st.markdown("""
 try:
     pizza_df = load_data()
 except Exception as e:
-    st.error("Could not connect to the Pizza Store database.")
+    st.error("Could not load the Pizza Store data.")
     st.code(str(e))
     st.info(
-        "Check that MySQL is running and the database credentials in this app "
-        "match your local MySQL configuration."
+        "Make sure the four CSV files are present in the same folder as pizza_app.py."
     )
     st.stop()
 
